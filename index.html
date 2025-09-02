@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dae's Base Planner</title>
+<style>
+  :root {
+    --bg:#f1f5f9; --text:#0f172a; --ui:#ffffff; --border:#e2e8f0; --shadow:0 4px 16px rgba(0,0,0,.08);
+    --blue:#2563eb; --blue2:#1d4ed8; --sq:#93c5fd; --tri:#86efac; --quarter:#f9a8d4; --rt13:#a78bfa;
+    --ghost:#06b6d4; --warn:#ef4444;
+  }
+  html,body,#root{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  .toolbar{position:fixed;top:16px;left:16px;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px;background:rgba(255,255,255,.9);backdrop-filter:blur(6px);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow)}
+  .btn{padding:8px 12px;border-radius:12px;border:1px solid var(--border);background:#fff;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .btn.active{background:var(--blue);color:#fff;border-color:var(--blue2)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .sep{width:1px;height:24px;background:var(--border);margin:0 6px}
+  .checkbox{display:inline-flex;align-items:center;gap:6px;font-size:14px}
+  .stat{font-size:14px;padding:4px 8px;background:#fff;border:1px solid var(--border);border-radius:10px}
+  .screen{width:100%;height:100vh;display:block}
+  .file{display:none}
+  .swatch{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:10px;padding:6px 8px;background:#fff}
+  .warn{color:var(--warn);font-size:12px;padding:2px 6px;border:1px solid var(--warn);border-radius:8px;background:#fff}
+
+  /* Armed glow for Clear All */
+  @keyframes pulseRing { 
+    0% { box-shadow:0 0 0 0 rgba(37,99,235,.45); } 
+    100% { box-shadow:0 0 0 12px rgba(37,99,235,0); } 
+  }
+  .armedWrap{display:inline-flex;align-items:center;gap:6px;padding:2px 6px;border-radius:10px}
+  .armedWrap.armed{animation:pulseRing .8s ease-out 1}
+  .armedTag{font-size:12px;padding:2px 6px;border-radius:8px;background:#e0f2fe;color:#075985;border:1px solid #bae6fd}
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useRef, useState, useMemo, useEffect } = React;
+
+/* ---------- Math helpers ---------- */
+const EPS = 1e-6;
+const eq = (a,b)=>Math.abs(a-b)<EPS;
+const add=(p,q)=>[p[0]+q[0],p[1]+q[1]];
+const sub=(p,q)=>[p[0]-q[0],p[1]-q[1]];
+const mul=(p,k)=>[p[0]*k,p[1]*k];
+const dot=(u,v)=>u[0]*v[0]+u[1]*v[1];
+const len=(p,q)=>Math.hypot(q[0]-p[0],q[1]-p[1]);
+const perpL=(u)=>[-u[1], u[0]];
+const perpR=(u)=>[ u[1],-u[0]];
+const norm=(u)=>{const L=Math.hypot(u[0],u[1])||1;return [u[0]/L,u[1]/L];};
+const centroid=(poly)=>{let x=0,y=0;for(const p of poly){x+=p[0];y+=p[1];}return [x/poly.length,y/poly.length];};
+const signedArea=(poly)=>{let s=0;for(let i=0;i<poly.length;i++){const [x1,y1]=poly[i];const [x2,y2]=poly[(i+1)%poly.length];s+=x1*y2-x2*y1;}return 0.5*s;};
+function bbox(poly){let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;for(const [x,y] of poly){if(x<minX)minX=x;if(y<minY)minY=y;if(x>maxX)maxX=x;if(y>maxY)maxY=y;}return {minX,minY,maxX,maxY};}
+
+/* Strict interior-overlap (edge-touch allowed) */
+function overlapStrict(p1,p2){
+  function axes(poly){const out=[];for(let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];const e=sub(b,a);const n=norm(perpL(e));out.push(n);}return out;}
+  function proj(poly,ax){let min=Infinity,max=-Infinity;for(const p of poly){const t=dot(p,ax);if(t<min)min=t;if(t>max)max=t;}return [min,max];}
+  let touching=false;
+  for(const ax of [...axes(p1),...axes(p2)]){
+    const [a1,a2]=proj(p1,ax), [b1,b2]=proj(p2,ax);
+    if (a2 < b1 - EPS || b2 < a1 - EPS) return false;
+    if (a2 <= b1 + EPS || b2 <= a1 + EPS) touching = true;
+  }
+  return !touching;
+}
+
+/* ---------- Shape builders ---------- */
+function triangleFromEdge(A,B,side,outwardUnit){
+  const mid=mul(add(A,B),0.5);
+  const h = (Math.sqrt(3)/2)*side;
+  const C = add(mid, mul(outwardUnit, h));
+  return [A,B,C];
+}
+function squareFromEdge(A,B,side,outwardUnit){
+  const C = add(B, mul(outwardUnit, side));
+  const D = add(A, mul(outwardUnit, side));
+  return [A,B,C,D];
+}
+function quarterFromEdgeCorner(A,B,side,outwardUnit, steps=24){
+  const d = norm(sub(B,A));
+  const n = norm(outwardUnit);
+  const D = add(A, mul(n, side));
+  const pts = [A, B];
+  for (let k=1; k<steps; k++){
+    const t = k/steps;
+    const theta = Math.PI/2 * (1 - t);
+    const P = add(A, add(mul(n, side*Math.cos(theta)), mul(d, side*Math.sin(theta))));
+    pts.push(P);
+  }
+  pts.push(D);
+  const snapEdges = [[A,B],[D,A]];
+  return { pts, snapEdges };
+}
+function rt13FromEdgeCorner(A,B,side,outwardUnit, mode){
+  const n = norm(outwardUnit);
+  if (mode==='short'){
+    const C = add(A, mul(n, 3*side));
+    const pts = [A,B,C];
+    const snapEdges = [[A,B],[A,C]];
+    return { pts, snapEdges };
+  } else {
+    const C = add(A, mul(n, side));
+    const pts = [A,B,C];
+    const snapEdges = [[A,B],[A,C]];
+    return { pts, snapEdges };
+  }
+}
+function pointInPoly(pt, poly){
+  let wn=0;
+  for(let i=0;i<poly.length;i++){
+    const a=poly[i], b=poly[(i+1)%poly.length];
+    if (eq(len(a,pt)+len(pt,b), len(a,b))) return false;
+    if (a[1]<=pt[1]) {
+      if (b[1]>pt[1] && ((b[0]-a[0])*(pt[1]-a[1])-(pt[0]-a[0])*(b[1]-a[1]))>0) wn++;
+    } else {
+      if (b[1]<=pt[1] && ((b[0]-a[0])*(pt[1]-a[1])-(pt[0]-a[0])*(b[1]-a[1]))<0) wn--;
+    }
+  }
+  return wn!==0;
+}
+
+/* ---------- App ---------- */
+function App(){
+  const [tool,setTool]=useState("placeAuto");
+  const [side,setSide]=useState(40);
+  const [tiles,setTiles]=useState([]); // {id, kind, pts, color, snapEdges?}
+  const idRef=useRef(1);
+
+  const css = getComputedStyle(document.documentElement);
+  const [defaultSquare,setDefaultSquare]=useState(css.getPropertyValue('--sq').trim() || "#93c5fd");
+  const [defaultTriangle,setDefaultTriangle]=useState(css.getPropertyValue('--tri').trim() || "#86efac");
+  const [defaultQuarter,setDefaultQuarter]=useState(css.getPropertyValue('--quarter').trim() || "#f9a8d4");
+  const [defaultRT13,setDefaultRT13]=useState(css.getPropertyValue('--rt13').trim() || "#a78bfa");
+
+  const [showGrid,setShowGrid]=useState(true);
+  const [showLengths,setShowLengths]=useState(false);
+  const [showAngles,setShowAngles]=useState(false);
+
+  const [tx,setTx]=useState(200), [ty,setTy]=useState(150), [scale,setScale]=useState(1);
+  const svgRef=useRef(null);
+  const drag=useRef({down:false,start:[0,0],panStart:[0,0],button:0,moved:false});
+  const rightDrag=useRef(null);
+  const midDrag = useRef(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const DRAG=4;
+
+  const [axisLockSquares,setAxisLockSquares]=useState(false);
+  const [snapPref,setSnapPref]=useState("auto");
+
+  // Walls
+  const [walls, setWalls] = useState([]);
+  const [wallColor, setWallColor] = useState("#111827");
+  const [wallWidth, setWallWidth] = useState(4);
+  const [hoverWallEdge, setHoverWallEdge] = useState(null);
+
+  // Paint tool
+  const [paintColor,setPaintColor]=useState("#fbbf24");
+
+  // Ghost placement preview
+  const [preview, setPreview] = useState(null);
+
+  // Clear All confirmation + flash
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [armedFlash, setArmedFlash] = useState(false);
+
+  // HISTORY (undo/redo)
+  const hist=useRef({stack:[], idx:-1});
+  function pushHistory(nextTiles,nextWalls=walls){
+    const snap = JSON.stringify({tiles:nextTiles, walls:nextWalls});
+    const trimmed = hist.current.stack.slice(0, hist.current.idx+1);
+    trimmed.push(snap);
+    hist.current.stack = trimmed;
+    hist.current.idx = trimmed.length-1;
+  }
+  function canUndo(){ return hist.current.idx>0; }
+  function canRedo(){ return hist.current.idx < hist.current.stack.length-1; }
+  function undo(){
+    if (!canUndo()) return;
+    hist.current.idx--;
+    const snap = JSON.parse(hist.current.stack[hist.current.idx]);
+    setTiles(snap.tiles || []);
+    setWalls(snap.walls || []);
+  }
+  function redo(){
+    if (!canRedo()) return;
+    hist.current.idx++;
+    const snap = JSON.parse(hist.current.stack[hist.current.idx]);
+    setTiles(snap.tiles || []);
+    setWalls(snap.walls || []);
+  }
+  useEffect(()=>{ pushHistory([],[]); },[]);
+
+  // Clear everything (uses checkbox confirmation)
+  function clearAll(){
+    const emptyTiles = [];
+    const emptyWalls = [];
+    setTiles(emptyTiles);
+    setWalls(emptyWalls);
+    setSelected(new Set());
+    setPreview(null);
+    setHoverWallEdge(null);
+    setTx(200); setTy(150); setScale(1);
+    setConfirmClear(false);
+    pushHistory(emptyTiles, emptyWalls);
+  }
+
+  function worldToScreen(p){ return [p[0]*scale+tx, p[1]*scale+ty]; }
+  function screenToWorld(p){ return [(p[0]-tx)/scale, (p[1]-ty)/scale]; }
+
+  /* Edges for snapping (respect per-shape snapEdges) */
+  const snapEdges = useMemo(()=>{
+    const out=[];
+    for(const t of tiles){
+      const pts=t.pts;
+      const area = signedArea(pts);
+      const outwardFrom = (e)=> area>0 ? norm(perpR(e)) : norm(perpL(e));
+      const pairs = t.snapEdges ? t.snapEdges : (()=> {
+        const arr=[];
+        for(let i=0;i<pts.length;i++){ arr.push([pts[i], pts[(i+1)%pts.length]]); }
+        return arr;
+      })();
+      for(const [A,B] of pairs){
+        const e=sub(B,A);
+        const outward = outwardFrom(e);
+        out.push({A,B,outward, owner:t});
+      }
+    }
+    return out;
+  },[tiles]);
+
+  /* Edges for WALLS selection */
+  const wallEdgesAll = useMemo(()=>{
+    const out=[];
+    for(const t of tiles){
+      const pts=t.pts, n=pts.length;
+      if (t.kind==='quarter'){
+        const A0=pts[0], B0=pts[1];
+        out.push({tile:t, i:0, A:A0, B:B0});
+        const Al=pts[n-1], Bl=pts[0];
+        out.push({tile:t, i:n-1, A:Al, B:Bl});
+      } else {
+        for(let i=0;i<n;i++){
+          const A=pts[i], B=pts[(i+1)%n];
+          out.push({tile:t, i, A, B});
+        }
+      }
+    }
+    return out;
+  },[tiles]);
+
+  /* Candidate generator */
+  function candidates(toolMode){
+    if (tiles.length===0) return null;
+    const cands=[];
+    for(const {A,B,outward} of snapEdges){
+      const L = len(A,B);
+
+      const allowSquares = (toolMode==="placeSquare" || toolMode==="placeAuto");
+      const allowTris    = (toolMode==="placeTriangle" || toolMode==="placeAuto");
+      const allowQuarter = (toolMode==="placeQuarter" || toolMode==="placeAuto");
+      const allowRT13    = (toolMode==="placeRT13"   || toolMode==="placeAuto");
+
+      if (allowTris && eq(L, side)){
+        cands.push({kind:"triangle", pts:triangleFromEdge(A,B,side,outward), srcA:A, srcB:B});
+      }
+      if (allowSquares){
+        const v=sub(B,A);
+        if (!(axisLockSquares && !(eq(v[0],0)||eq(v[1],0)))){
+          if (eq(L, side)){
+            cands.push({kind:"square", pts:squareFromEdge(A,B,side,outward), srcA:A, srcB:B});
+          }
+        }
+      }
+      if (allowQuarter && eq(L, side)){
+        const qA = quarterFromEdgeCorner(A,B,side,outward);
+        cands.push({kind:"quarter", pts:qA.pts, snapEdges:qA.snapEdges, srcA:A, srcB:B});
+        const qB = quarterFromEdgeCorner(B,A,side,outward);
+        cands.push({kind:"quarter", pts:qB.pts, snapEdges:qB.snapEdges, srcA:B, srcB:A});
+      }
+      if (allowRT13){
+        if (eq(L, side)){
+          const rA = rt13FromEdgeCorner(A,B,side,outward,'short');
+          cands.push({kind:"rt13", pts:rA.pts, snapEdges:rA.snapEdges, srcA:A, srcB:B});
+          const rB = rt13FromEdgeCorner(B,A,side,outward,'short');
+          cands.push({kind:"rt13", pts:rB.pts, snapEdges:rB.snapEdges, srcA:B, srcB:A});
+        }
+        if (eq(L, 3*side)){
+          const rA = rt13FromEdgeCorner(A,B,side,outward,'long');
+          cands.push({kind:"rt13", pts:rA.pts, snapEdges:rA.snapEdges, srcA:A, srcB:B});
+          const rB = rt13FromEdgeCorner(B,A,side,outward,'long');
+          cands.push({kind:"rt13", pts:rB.pts, snapEdges:rB.snapEdges, srcA:B, srcB:A});
+        }
+      }
+    }
+
+    // filter: allow edge touch, block interior overlap
+    const filtered=[];
+    candLoop: for(const c of cands){
+      const bbC=bbox(c.pts);
+      for(const t of tiles){
+        const bbT=bbox(t.pts);
+        if (!(bbC.maxX < bbT.minX - EPS || bbC.minX > bbT.maxX + EPS || bbC.maxY < bbT.minY - EPS || bbC.minY > bbT.maxY + EPS)){
+          if (overlapStrict(c.pts, t.pts)) continue candLoop;
+        }
+      }
+      filtered.push(c);
+    }
+
+    if (toolMode==="placeAuto" && filtered.length){
+      if (snapPref==="square"){
+        const sub = filtered.filter(c=>c.kind==="square");
+        if (sub.length) return sub;
+      } else if (snapPref==="triangle"){
+        const sub = filtered.filter(c=>c.kind==="triangle");
+        if (sub.length) return sub;
+      }
+    }
+    return filtered;
+  }
+
+  function nearestCandidate(worldPoint, cands){
+    if (!cands || cands.length===0) return null;
+    let best=null,bestD=Infinity;
+    for(const c of cands){
+      let dmin=Infinity;
+      const pts=c.pts;
+      for(let i=0;i<pts.length;i++){
+        const a=pts[i], b=pts[(i+1)%pts.length];
+        const vx=b[0]-a[0], vy=b[1]-a[1];
+        const wx=worldPoint[0]-a[0], wy=worldPoint[1]-a[1];
+        const c1=vx*wx+vy*wy;
+        if (c1<=0) dmin=Math.min(dmin, Math.hypot(worldPoint[0]-a[0], worldPoint[1]-a[1]));
+        else {
+          const c2=vx*vx+vy*vy;
+          if (c2<=c1) dmin=Math.min(dmin, Math.hypot(worldPoint[0]-b[0], worldPoint[1]-b[1]));
+          else {
+            const t=c1/c2; const proj=[a[0]+t*vx, a[1]+t*vy];
+            dmin=Math.min(dmin, Math.hypot(worldPoint[0]-proj[0], worldPoint[1]-proj[1]));
+          }
+        }
+      }
+      if (dmin<bestD){bestD=dmin;best=c;}
+    }
+    return best;
+  }
+
+  /* Walls hit-testing (screen space) */
+  function distPtSegScreen(px,py, ax,ay, bx,by){
+    const vx=bx-ax, vy=by-ay;
+    const wx=px-ax, wy=py-ay;
+    const c1=vx*wx+vy*wy;
+    if (c1<=0) return Math.hypot(px-ax, py-ay);
+    const c2=vx*vx+vy*vy;
+    if (c2<=c1) return Math.hypot(px-bx, py-by);
+    const t=c1/c2; const qx=ax+t*vx, qy=ay+t*vy;
+    return Math.hypot(px-qx, py-qy);
+  }
+  function findNearestWallEdge(clientX, clientY, thresholdPx=12){
+    if (!wallEdgesAll.length) return null;
+    const rect=svgRef.current.getBoundingClientRect();
+    const mx=clientX-rect.left, my=clientY-rect.top;
+    let best=null, bestD=Infinity;
+    for (const e of wallEdgesAll){
+      const [sx1,sy1]=worldToScreen(e.A);
+      const [sx2,sy2]=worldToScreen(e.B);
+      const d = distPtSegScreen(mx,my,sx1,sy1,sx2,sy2);
+      if (d<bestD){ bestD=d; best=e; }
+    }
+    if (best && bestD<=thresholdPx){
+      return {tileId:best.tile.id, i:best.i, A:best.A, B:best.B};
+    }
+    return null;
+  }
+  function toggleWallAtClientPoint(clientX, clientY){
+    const hit = findNearestWallEdge(clientX, clientY);
+    if (!hit) return;
+    const idx = walls.findIndex(w=> w.tileId===hit.tileId && w.i===hit.i);
+    let nextWalls;
+    if (idx>=0){
+      nextWalls = walls.slice(); nextWalls.splice(idx,1);
+    }else{
+      nextWalls = [...walls, {tileId:hit.tileId, i:hit.i, color:wallColor, width:wallWidth}];
+    }
+    setWalls(nextWalls); pushHistory(tiles,nextWalls);
+  }
+  function clearWalls(){
+    setWalls([]); pushHistory(tiles,[]);
+  }
+
+  /* Selection */
+  const [selected,setSelected] = useState(new Set());
+  function setSelectedFromArray(arr){ setSelected(new Set(arr)); }
+  function isSelected(id){ return selected.has(id); }
+  function hitTest(ptWorld){
+    let candidates=[];
+    tiles.forEach((t)=>{ if(pointInPoly(ptWorld, t.pts)) candidates.push(t); });
+    if (!candidates.length) return null;
+    let best=null, bestD=Infinity;
+    for(const t of candidates){ const c=centroid(t.pts); const d=len(c,ptWorld); if(d<bestD){bestD=d; best=t;} }
+    return best;
+  }
+
+  /* Move / Clone (Alt/Meta drag) */
+  const moveState = useRef(null);
+  const [dragPreview,setDragPreview]=useState(null);
+  function startMove(ptWorld, clickedTile, cloning){
+    const ids = selected.size && isSelected(clickedTile.id) ? new Set(selected) : new Set([clickedTile.id]);
+    const orig = new Map();
+    tiles.forEach(t=>{ if(ids.has(t.id)) orig.set(t.id, t.pts.map(p=>[p[0],p[1]])); });
+    moveState.current = { ids, start:ptWorld, origPts:orig, cloning };
+  }
+  function updateMove(ptWorld){
+    const st = moveState.current; if(!st) return;
+    const dx = ptWorld[0]-st.start[0], dy = ptWorld[1]-st.start[1];
+    const previewTiles = tiles.map(t=>{
+      if (!st.ids.has(t.id)) return t;
+      const base = st.origPts.get(t.id);
+      const moved = base.map(p=>[p[0]+dx,p[1]+dy]);
+      if (st.cloning){
+        return {id: `clone-${t.id}`, kind:t.kind, pts:moved, color:t.color, snapEdges:t.snapEdges};
+      } else {
+        return {id: t.id, kind:t.kind, pts:moved, color:t.color, snapEdges:t.snapEdges};
+      }
+    });
+    let bad=false;
+    for(const pt of previewTiles){
+      const isMoved = (typeof pt.id==="string" && pt.id.startsWith("clone-")) || st.ids.has(pt.id);
+      if (!isMoved) continue;
+      for(const base of tiles){
+        if (st.ids.has(base.id)) continue;
+        if (overlapStrict(pt.pts, base.pts)) { bad = true; break; }
+      }
+      if (bad) break;
+    }
+    setDragPreview({tiles:previewTiles, bad});
+  }
+  function commitMove(){
+    const st = moveState.current; if(!st) return;
+    if (!dragPreview){ moveState.current=null; return; }
+    if (dragPreview.bad){ setDragPreview(null); moveState.current=null; return; }
+    let next;
+    if (st.cloning){
+      const clones = dragPreview.tiles.filter(t=> typeof t.id==="string" && t.id.startsWith("clone-"))
+        .map(t=>({id:idRef.current++, kind:t.kind, pts:t.pts, color:t.color, snapEdges:t.snapEdges}));
+      next=[...tiles, ...clones];
+    } else {
+      const movedMap = new Map();
+      dragPreview.tiles.forEach(t=>{ if (st.ids.has(t.id)) movedMap.set(t.id, t); });
+      next = tiles.map(t=> st.ids.has(t.id) ? movedMap.get(t.id) : t);
+    }
+    setTiles(next); pushHistory(next,walls);
+    setDragPreview(null);
+    moveState.current=null;
+  }
+  function cancelMove(){ setDragPreview(null); moveState.current=null; }
+
+  /* Place / Delete */
+  function placeAt(pWorld){
+    if (!tiles.length){
+      let next;
+      if (tool==="placeTriangle"){
+        const A=[pWorld[0]-side/2, pWorld[1]];
+        const B=[pWorld[0]+side/2, pWorld[1]];
+        const tri=triangleFromEdge(A,B,side,[0,1]);
+        next=[{id:idRef.current++, kind:"triangle", pts:tri, color:defaultTriangle}];
+      } else if (tool==="placeQuarter"){
+        const A=[pWorld[0]-side/2, pWorld[1]];
+        const B=[pWorld[0]+side/2, pWorld[1]];
+        const q = quarterFromEdgeCorner(A,B,side,[0,1]);
+        next=[{id:idRef.current++, kind:"quarter", pts:q.pts, color:defaultQuarter, snapEdges:q.snapEdges}];
+      } else if (tool==="placeRT13"){
+        const A=[pWorld[0]-side/2, pWorld[1]];
+        const B=[pWorld[0]+side/2, pWorld[1]];
+        const r = rt13FromEdgeCorner(A,B,side,[0,1],'short');
+        next=[{id:idRef.current++, kind:"rt13", pts:r.pts, color:defaultRT13, snapEdges:r.snapEdges}];
+      } else {
+        const h=side/2;
+        const sq=[[pWorld[0]-h,pWorld[1]-h],[pWorld[0]+h,pWorld[1]-h],[pWorld[0]+h,pWorld[1]+h],[pWorld[0]-h,pWorld[1]+h]];
+        next=[{id:idRef.current++, kind:"square", pts:sq, color:defaultSquare}];
+      }
+      setTiles(next); pushHistory(next,walls);
+      return;
+    }
+    const cands = candidates(tool);
+    const best = nearestCandidate(pWorld,cands);
+    if (!best) return;
+    const color = best.kind==="square" ? defaultSquare
+                  : best.kind==="triangle" ? defaultTriangle
+                  : best.kind==="quarter" ? defaultQuarter
+                  : defaultRT13;
+    const tile = {id:idRef.current++, kind:best.kind, pts:best.pts, color};
+    if (best.snapEdges) tile.snapEdges = best.snapEdges;
+    const next=[...tiles, tile];
+    setTiles(next); pushHistory(next,walls);
+  }
+  function deleteNearest(pWorld){
+    if (!tiles.length) return;
+    let bestIdx=-1,bestD=Infinity;
+    tiles.forEach((t,idx)=>{const c=centroid(t.pts);const d=len(c,pWorld);if(d<bestD){bestD=d;bestIdx=idx;}});
+    if (bestIdx>=0){
+      const victimId = tiles[bestIdx].id;
+      const nextTiles=[...tiles]; nextTiles.splice(bestIdx,1);
+      const nextWalls = walls.filter(w=> w.tileId!==victimId);
+      setTiles(nextTiles); setWalls(nextWalls); pushHistory(nextTiles,nextWalls);
+    }
+  }
+
+  /* Export / Import */
+  const fileRef = useRef(null);
+  function exportJSON(){
+    const data = { version:4, side, tiles, walls, wallColorDefault:wallColor, wallWidthDefault:wallWidth };
+    const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download='layout.json'; a.click();
+    URL.revokeObjectURL(url);
+  }
+  function loadJSONFromFile(ev){
+    const f = ev.target.files?.[0]; if(!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        const data = JSON.parse(reader.result);
+        if (data.side) setSide(data.side);
+        if (Array.isArray(data.tiles)) setTiles(data.tiles);
+        if (Array.isArray(data.walls)) setWalls(data.walls);
+        if (typeof data.wallColorDefault==="string") setWallColor(data.wallColorDefault);
+        if (typeof data.wallWidthDefault==="number") setWallWidth(data.wallWidthDefault);
+        pushHistory(data.tiles||[], data.walls||[]);
+        setSelected(new Set());
+      }catch(err){ alert('Invalid JSON'); }
+    };
+    reader.readAsText(f);
+    ev.target.value = '';
+  }
+  function exportSVG(){
+    const svg = svgRef.current.cloneNode(true);
+    const serializer = new XMLSerializer();
+    let src = serializer.serializeToString(svg);
+    if(!src.match(/^<svg[^>]+xmlns=/)){
+      src = src.replace(/^<svg/,'<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+    const blob = new Blob(['<?xml version="1.0" standalone="no"?>\n', src], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download='layout.svg'; a.click();
+    URL.revokeObjectURL(url);
+  }
+  function exportPNG(){
+    const svgNode = svgRef.current;
+    const serializer = new XMLSerializer();
+    let src = serializer.serializeToString(svgNode);
+    if(!src.match(/^<svg[^>]+xmlns=/)){
+      src = src.replace(/^<svg/,'<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+    const svgBlob = new Blob([src], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(svgBlob);
+    const img = new Image();
+    const W = svgNode.clientWidth, H = svgNode.clientHeight;
+    img.onload = function(){
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg') || '#f1f5f9';
+      ctx.fillRect(0,0,W,H);
+      ctx.drawImage(img,0,0,W,H);
+      URL.revokeObjectURL(url);
+      canvas.toBlob((blob)=>{
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download='layout.png';
+        a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href), 500);
+      });
+    };
+    img.src = url;
+  }
+
+  /* Toolbar helpers */
+  const active = (n)=>tool===n?"btn active":"btn";
+  const squaresCount   = tiles.filter(t=>t.kind==='square').length;
+  const trisCount      = tiles.filter(t=>t.kind==='triangle').length;
+  const quartersCount  = tiles.filter(t=>t.kind==='quarter').length;
+  const rt13Count      = tiles.filter(t=>t.kind==='rt13').length;
+
+  /* Mouse handlers */
+  function onMouseDown(e){
+    const rect=svgRef.current.getBoundingClientRect();
+    const pWorld=screenToWorld([e.clientX-rect.left, e.clientY-rect.top]);
+
+    if (e.button === 1) { e.preventDefault(); midDrag.current = { start:[e.clientX,e.clientY] }; setIsPanning(true); return; }
+    if (e.button===2){ rightDrag.current = {start:[e.clientX,e.clientY], pWorld}; return; }
+
+    if (tool==="select"){
+      const t = hitTest(pWorld);
+      if (t){
+        if (e.metaKey || e.ctrlKey){
+          const next=new Set(selected);
+          if (next.has(t.id)) next.delete(t.id); else next.add(t.id);
+          setSelected(next);
+        } else if (!isSelected(t.id)){
+          setSelected(new Set([t.id]));
+        }
+        startMove(pWorld, t, e.altKey || e.metaKey);
+        setDragPreview(null);
+      } else {
+        drag.current={down:true,start:[e.clientX,e.clientY],panStart:[tx,ty],button:0,moved:false, marquee:true};
+      }
+      return;
+    }
+
+    if (tool==="paint"){
+      const t = hitTest(pWorld);
+      if (t){
+        const next = tiles.map(x=> x.id===t.id ? {...x, color:paintColor} : x);
+        setTiles(next); pushHistory(next,walls);
+      }
+      return;
+    }
+
+    if (tool==="wall"){
+      return;
+    }
+
+    drag.current={down:true,start:[e.clientX,e.clientY],panStart:[tx,ty],button:0,moved:false};
+  }
+
+  function onMouseMove(e){
+    const rect=svgRef.current.getBoundingClientRect();
+    const pWorld=screenToWorld([e.clientX-rect.left, e.clientY-rect.top]);
+
+    if (midDrag.current){
+      const dx = e.clientX - midDrag.current.start[0];
+      const dy = e.clientY - midDrag.current.start[1];
+      setTx(tx0 => tx0 + dx);
+      setTy(ty0 => ty0 + dy);
+      midDrag.current.start = [e.clientX, e.clientY];
+      return;
+    }
+
+    if (rightDrag.current){
+      const dx = e.clientX - rightDrag.current.start[0];
+      const dy = e.clientY - rightDrag.current.start[1];
+      if (Math.abs(dx)>DRAG || Math.abs(dy)>DRAG){
+        setTx(tx0=>tx0+dx); setTy(ty0=>ty0+dy);
+        rightDrag.current.start=[e.clientX,e.clientY];
+        rightDrag.current.panning = true;
+      }
+      return;
+    }
+
+    if (tool==="select"){
+      if (moveState.current){ updateMove(pWorld); return; }
+      if (drag.current.down && drag.current.marquee){
+        drag.current.moved=true;
+        const x1=drag.current.start[0], y1=drag.current.start[1], x2=e.clientX, y2=e.clientY;
+        const minX=Math.min(x1,x2), minY=Math.min(y1,y2), maxX=Math.max(x1,x2), maxY=Math.max(y1,y2);
+        const minW=screenToWorld([minX,minY]), maxW=screenToWorld([maxX,maxY]);
+        const sel=[];
+        for(const t of tiles){
+          const c=centroid(t.pts);
+          if (c[0]>=minW[0] && c[0]<=maxW[0] && c[1]>=minW[1] && c[1]<=maxW[1]) sel.push(t.id);
+        }
+        if (e.metaKey || e.ctrlKey){
+          const next=new Set(selected);
+          sel.forEach(id=> next.add(id));
+          setSelected(next);
+        } else {
+          setSelectedFromArray(sel);
+        }
+        return;
+      }
+    }
+
+    if (tool==="wall"){
+      const hit = findNearestWallEdge(e.clientX, e.clientY);
+      setHoverWallEdge(hit);
+      return;
+    }
+
+    const cands = candidates(tool);
+    const best = nearestCandidate(pWorld,cands);
+    setPreview(best);
+    setHoverWallEdge(null);
+  }
+
+  function onMouseUp(e){
+    const rect=svgRef.current.getBoundingClientRect();
+    const pWorld=screenToWorld([e.clientX-rect.left, e.clientY-rect.top]);
+
+    if (e.button === 1){ midDrag.current = null; setIsPanning(false); return; }
+    if (e.button===2){
+      const rd = rightDrag.current;
+      if (!rd) return;
+      const moved = rd.panning;
+      rightDrag.current=null;
+      if (!moved) deleteNearest(pWorld);
+      return;
+    }
+
+    if (tool==="select"){
+      if (moveState.current){ commitMove(); return; }
+      if (drag.current.marquee){ drag.current={down:false}; return; }
+    }
+
+    if (tool==="wall"){
+      toggleWallAtClientPoint(e.clientX, e.clientY);
+      return;
+    }
+
+    placeAt(pWorld);
+    drag.current={down:false};
+  }
+
+  function onMouseLeave(){
+    midDrag.current=null;
+    rightDrag.current=null;
+    setIsPanning(false);
+    setPreview(null);
+    setHoverWallEdge(null);
+  }
+  function onWheel(e){
+    e.preventDefault();
+    const factor=Math.pow(1.0015,e.deltaY);
+    const rect=svgRef.current.getBoundingClientRect();
+    const mouse=[e.clientX-rect.left, e.clientY-rect.top];
+    const before=screenToWorld(mouse);
+    setScale(s=>Math.min(4,Math.max(0.2,s/factor)));
+    requestAnimationFrame(()=>{
+      const after=worldToScreen(before);
+      setTx(tx0=>tx0+(mouse[0]-after[0]));
+      setTy(ty0=>ty0+(mouse[1]-after[1]));
+    });
+  }
+
+  /* Keyboard helpers */
+  useEffect(()=>{
+    function onKey(e){
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && (e.key==='z' || e.key==='Z')){ e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
+      if (mod && (e.key==='y' || e.key==='Y')){ e.preventDefault(); redo(); }
+      if (mod && (e.key==='n' || e.key==='N')){
+        e.preventDefault();
+        if (confirmClear) {
+          clearAll();
+        } else {
+          setConfirmClear(true);
+          setArmedFlash(true);
+          setTimeout(()=>setArmedFlash(false), 800);
+        }
+      }
+      if (e.key==='Escape'){ cancelMove(); setHoverWallEdge(null); setPreview(null); }
+      if (e.key==='Delete' || e.key==='Backspace'){
+        if (selected.size){
+          const victimIds = new Set(selected);
+          const next = tiles.filter(t=> !victimIds.has(t.id));
+          const nextWalls = walls.filter(w=> !victimIds.has(w.tileId));
+          setTiles(next); setWalls(nextWalls); setSelected(new Set()); pushHistory(next,nextWalls);
+        }
+      }
+      if (e.key==='Shift') setAxisLockSquares(al=>!al);
+    }
+    function onKeyUp(e){ if (e.key==='Shift') setAxisLockSquares(al=>!al); }
+    window.addEventListener('keydown',onKey);
+    window.addEventListener('keyup',onKeyUp);
+    return ()=>{ window.removeEventListener('keydown',onKey); window.removeEventListener('keyup',onKeyUp); };
+  },[tiles,selected,walls,confirmClear]);
+
+  /* Dimensions helpers */
+  function angleAt(poly, i){
+    const n=poly.length; const A=poly[(i-1+n)%n], B=poly[i], C=poly[(i+1)%n];
+    const u=norm(sub(A,B)), v=norm(sub(C,B));
+    const cos = Math.max(-1, Math.min(1, dot(u,v) ));
+    return Math.acos(cos) * 180/Math.PI;
+  }
+
+  return (
+    <div>
+      <div className="toolbar">
+        <span style={{fontWeight:600}}>Tool:</span>
+        <button className={active("placeAuto")} onClick={()=>setTool("placeAuto")}>Auto</button>
+        <button className={active("placeSquare")} onClick={()=>setTool("placeSquare")}>■ Square</button>
+        <button className={active("placeTriangle")} onClick={()=>setTool("placeTriangle")}>▲ Equi Tri</button>
+        <button className={active("placeQuarter")} onClick={()=>setTool("placeQuarter")}>◔ Quarter</button>
+        <button className={active("placeRT13")} onClick={()=>setTool("placeRT13")}>▭ Rt 1×3</button>
+        <button className={active("select")} onClick={()=>setTool("select")}>🖱️ Select/Move</button>
+        <button className={active("paint")} onClick={()=>setTool("paint")}>🎨 Paint</button>
+        <button className={active("wall")} onClick={()=>setTool("wall")}>🚧 Wall</button>
+
+        <div className="sep"></div>
+        <label className="checkbox">
+          <span>Side:</span>
+          <input type="range" min="20" max="100" value={side} onChange={e=>setSide(parseInt(e.target.value))}/>
+          <span style={{minWidth:30,textAlign:"right"}}>{side}px</span>
+        </label>
+        <label className="checkbox"><input type="checkbox" checked={axisLockSquares} onChange={e=>setAxisLockSquares(e.target.checked)}/><span>Axis-lock squares (Shift to toggle)</span></label>
+        <label className="checkbox">
+          <span>Snap pref:</span>
+          <select value={snapPref} onChange={e=>setSnapPref(e.target.value)}>
+            <option value="auto">Auto</option>
+            <option value="square">Prefer squares</option>
+            <option value="triangle">Prefer triangles</option>
+          </select>
+        </label>
+
+        <div className="sep"></div>
+        <span className="swatch">Square <input type="color" value={defaultSquare} onChange={e=>setDefaultSquare(e.target.value)}/></span>
+        <span className="swatch">Equi Tri <input type="color" value={defaultTriangle} onChange={e=>setDefaultTriangle(e.target.value)}/></span>
+        <span className="swatch">Quarter <input type="color" value={defaultQuarter} onChange={e=>setDefaultQuarter(e.target.value)}/></span>
+        <span className="swatch">Rt 1×3 <input type="color" value={defaultRT13} onChange={e=>setDefaultRT13(e.target.value)}/></span>
+        <span className="swatch">Paint <input type="color" value={paintColor} onChange={e=>setPaintColor(e.target.value)}/></span>
+
+        <div className="sep"></div>
+        <span className="swatch">Wall <input type="color" value={wallColor} onChange={e=>setWallColor(e.target.value)}/></span>
+        <label className="checkbox">
+          <span>Wall width:</span>
+          <input type="range" min="1" max="12" value={wallWidth} onChange={e=>setWallWidth(parseInt(e.target.value))}/>
+          <span style={{minWidth:24,textAlign:"right"}}>{wallWidth}px</span>
+        </label>
+        <button className="btn" onClick={clearWalls}>Clear walls</button>
+
+        <div className="sep"></div>
+        <label className="checkbox"><input type="checkbox" checked={showGrid} onChange={e=>setShowGrid(e.target.checked)}/><span>Grid</span></label>
+        <label className="checkbox"><input type="checkbox" checked={showLengths} onChange={e=>setShowLengths(e.target.checked)}/><span>Lengths</span></label>
+        <label className="checkbox"><input type="checkbox" checked={showAngles} onChange={e=>setShowAngles(e.target.checked)}/><span>Angles</span></label>
+
+        <div className="sep"></div>
+        <button className="btn" onClick={undo} disabled={!canUndo()}>Undo ⌘/Ctrl+Z</button>
+        <button className="btn" onClick={redo} disabled={!canRedo()}>Redo ⌘/Ctrl+Y</button>
+
+        {/* Clear All with confirm + glow */}
+        <div className="sep"></div>
+        <label className={`checkbox armedWrap ${armedFlash ? 'armed' : ''}`} title="Arm this to enable Clear All (⌘/Ctrl+N)">
+          <input
+            type="checkbox"
+            checked={confirmClear}
+            onChange={e=>{
+              setConfirmClear(e.target.checked);
+              if (e.target.checked){ setArmedFlash(true); setTimeout(()=>setArmedFlash(false), 800); }
+            }}
+          />
+          <span>Confirm</span>
+          {confirmClear && <span className="armedTag">Armed!</span>}
+        </label>
+        <button className="btn" onClick={clearAll} title="⌘/Ctrl+N" disabled={!confirmClear}>🗑️ Clear All</button>
+
+        <div className="sep"></div>
+        <button className="btn" onClick={exportJSON}>Save JSON</button>
+        <button className="btn" onClick={()=>fileRef.current.click()}>Load JSON</button>
+        <input className="file" ref={fileRef} type="file" accept=".json,application/json" onChange={loadJSONFromFile}/>
+        <button className="btn" onClick={exportSVG}>Export SVG</button>
+        <button className="btn" onClick={exportPNG}>Export PNG</button>
+
+        <div className="sep"></div>
+        <span className="stat">Squares: {squaresCount}</span>
+        <span className="stat">Equi Tris: {trisCount}</span>
+        <span className="stat">Quarters: {quartersCount}</span>
+        <span className="stat">Rt 1×3: {rt13Count}</span>
+        {dragPreview?.bad && <span className="warn">Placement blocked: overlap</span>}
+      </div>
+
+      <svg
+        ref={svgRef}
+        className="screen"
+        style={{ cursor: isPanning ? 'grabbing' : undefined }}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseLeave}
+        onAuxClick={(e)=>{ if (e.button===1) e.preventDefault(); }}
+        onContextMenu={(e)=>{ e.preventDefault(); }}
+        onWheel={onWheel}
+      >
+        <rect x="0" y="0" width="100%" height="100%" fill="var(--bg)"/>
+
+        {/* visual grid */}
+        {showGrid && (()=>{ 
+          const W=svgRef.current?.clientWidth||1200, H=svgRef.current?.clientHeight||800;
+          const dots=[]; const step=side;
+          for(let x=0;x<=W;x+=step){
+            for(let y=0;y<=H;y+=step){
+              const q=screenToWorld([x,y]);
+              const [sx,sy]=worldToScreen(q);
+              dots.push(<circle key={`g-${x}-${y}`} cx={sx} cy={sy} r="1.2" fill="#cbd5e1"/>);
+            }
+          }
+          return dots;
+        })()}
+
+        {/* drag preview */}
+        {dragPreview && dragPreview.tiles.map(t=>{
+          const pts=t.pts.map(worldToScreen);
+          const attr=pts.map(p=>p.join(",")).join(" ");
+          return <polygon key={`p-${t.id}`} points={attr} fill="none" stroke={dragPreview.bad?"var(--warn)":"var(--ghost)"} strokeDasharray="6 4" strokeWidth="2" opacity="0.9"/>;
+        })}
+
+        {/* placed tiles */}
+        {tiles.map(t=>{
+          const pts=t.pts.map(worldToScreen);
+          const attr=pts.map(p=>p.join(",")).join(" ");
+          const fill = t.color || (t.kind==="square" ? defaultSquare
+                          : t.kind==="triangle" ? defaultTriangle
+                          : t.kind==="quarter" ? defaultQuarter
+                          : defaultRT13);
+          const stroke = selected.has(t.id) ? "var(--blue2)" : "#334155";
+          const sw = selected.has(t.id) ? 2 : 1;
+          return <polygon key={t.id} points={attr} fill={fill} stroke={stroke} strokeWidth={sw}/>;
+        })}
+
+        {/* walls */}
+        {walls.map((w,idx)=>{
+          const t = tiles.find(tt=>tt.id===w.tileId);
+          if (!t) return null;
+          const n = t.pts.length;
+          const i = ((w.i%n)+n)%n;
+          const A = t.pts[i], B = t.pts[(i+1)%n];
+          const [x1,y1]=worldToScreen(A), [x2,y2]=worldToScreen(B);
+          return <line key={`wall-${idx}`} x1={x1} y1={y1} x2={x2} y2={y2} stroke={w.color} strokeWidth={w.width} strokeLinecap="round"/>;
+        })}
+
+        {/* wall hover */}
+        {hoverWallEdge && (()=> {
+          const [x1,y1]=worldToScreen(hoverWallEdge.A);
+          const [x2,y2]=worldToScreen(hoverWallEdge.B);
+          return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="var(--ghost)" strokeWidth={Math.max(2, wallWidth)} strokeDasharray="6 4" strokeLinecap="round" opacity="0.9"/>;
+        })()}
+
+        {/* placement preview */}
+        {(tool==="placeAuto"||tool==="placeSquare"||tool==="placeTriangle"||tool==="placeQuarter"||tool==="placeRT13") && preview && (()=> {
+          const pts=preview.pts.map(worldToScreen);
+          const attr=pts.map(p=>p.join(",")).join(" ");
+          return <polygon points={attr} fill="none" stroke="var(--ghost)" strokeDasharray="6 4" strokeWidth="2" opacity="0.9"/>;
+        })()}
+
+        {/* dimensions overlays */}
+        {(showLengths || showAngles) && tiles.map(t=>{
+          if (t.kind==="quarter") return null;
+          const overlays=[];
+          const pts=t.pts;
+          const S=pts.length;
+          for(let i=0;i<S;i++){
+            const a=pts[i], b=pts[(i+1)%S], mid=mul(add(a,b),0.5);
+            const [sx,sy] = worldToScreen(mid);
+            const L = len(a,b);
+            const ang = Math.round(angleAt(pts, i));
+            if (showLengths) overlays.push(<text key={`l-${t.id}-${i}`} x={sx} y={sy-6} fontSize="12" textAnchor="middle" fill="#0f172a" stroke="#fff" strokeWidth="2">{Math.round(L)}</text>,
+                                            <text key={`l2-${t.id}-${i}`} x={sx} y={sy-6} fontSize="12" textAnchor="middle" fill="#0f172a">{Math.round(L)}</text>);
+            if (showAngles){
+              const [vx,vy]=worldToScreen(pts[i]);
+              overlays.push(<text key={`a-${t.id}-${i}`} x={vx+8} y={vy-8} fontSize="12" fill="#0f172a" stroke="#fff" strokeWidth="2">{ang}°</text>,
+                            <text key={`a2-${t.id}-${i}`} x={vx+8} y={vy-8} fontSize="12" textAnchor="start" fill="#0f172a">{ang}°</text>);
+            }
+          }
+          return overlays;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App/>);
+</script>
+</body>
+</html>
